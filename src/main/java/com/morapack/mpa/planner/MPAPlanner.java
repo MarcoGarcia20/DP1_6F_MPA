@@ -27,65 +27,87 @@ public class MPAPlanner {
     private final Decoder decoder;
     private final int population;
     private final long timeLimitMs;
+    private final int maxIterations;
+    private final long noImproveMillis;
     private final Random rnd;
 
+    // Parámetros de movimiento
+    private static final double BROW_SIGMA_F1 = 0.10;  // exploración
+    private static final double BROW_SIGMA_F2 = 0.05;  // transición
+    private static final double LEVY_SCALE_F2 = 0.02;  // transición
+    private static final double LEVY_SCALE_F3 = 0.01;  // explotación
+    private static final double LEVY_BETA = 1.5;
+
+    // Precalculo de sigma para Lévy (estable durante toda la corrida)
+    private final double levySigma;
+
     public MPAPlanner(TEGraph graph, int population, long timeLimitMs, long seed) {
+        this(graph, population, timeLimitMs, seed, Integer.MAX_VALUE, Math.max(2000L, (long)(timeLimitMs*0.30)));
+    }
+
+    public MPAPlanner(TEGraph graph, int population, long timeLimitMs, long seed, int maxIterations, long noImproveMillis) {
         this.graph = graph;
         this.decoder = new Decoder(graph);
-        this.population = population;
-        this.timeLimitMs = timeLimitMs;
+        this.population = Math.max(4, population);
+        this.timeLimitMs = Math.max(1000L, timeLimitMs);
+        this.maxIterations = maxIterations;
+        this.noImproveMillis = noImproveMillis;
         this.rnd = new Random(seed);
+        this.levySigma = computeLevySigma(LEVY_BETA);
     }
 
     public Result solveWeekly(List<PackageOrder> orders) {
-        long t0 = System.currentTimeMillis();
+        final long t0 = System.currentTimeMillis();
 
-        // Inicialización: población de vectores [0,1]
-        int n = orders.size();
+        // Inicialización
+        final int n = orders.size();
         double[][] X = new double[population][n];
         for (int p=0; p<population; p++) for (int i=0; i<n; i++) X[p][i] = rnd.nextDouble();
 
-        Solution[] fitness = new Solution[population];
-        for (int p=0; p<population; p++) fitness[p] = decoder.decode(X[p], orders);
+        Solution[] fit = new Solution[population];
+        for (int p=0; p<population; p++) fit[p] = decoder.decode(X[p], orders);
 
-        Solution elite = fitness[0];
         int eliteIdx = 0;
-        for (int p=1; p<population; p++) if (fitness[p].fitness > elite.fitness) { elite = fitness[p]; eliteIdx = p; }
+        for (int p=1; p<population; p++) if (fit[p].fitness > fit[eliteIdx].fitness) eliteIdx = p;
+        Solution elite = fit[eliteIdx];
 
+        long lastImprove = System.currentTimeMillis();
         int iter = 0;
-        while (System.currentTimeMillis() - t0 < timeLimitMs) {
+
+        while (System.currentTimeMillis() - t0 < timeLimitMs && iter < maxIterations) {
             iter++;
             double progress = (System.currentTimeMillis() - t0) / (double) timeLimitMs;
 
-            // Para cada depredador, generar movimiento según fase
             for (int p=0; p<population; p++) {
-                double[] candidate = X[p].clone();
+                double[] cand = X[p].clone();
 
-                if (progress < 1.0/3.0) {                // Fase 1: Brownian (explorar)
-                    brownianMove(candidate, 0.10);
-                } else if (progress < 2.0/3.0) {         // Fase 2: mix
-                    brownianMove(candidate, 0.05);
-                    levyJump(candidate, 0.02);
-                } else {                                  // Fase 3: Lévy (explotar alrededor de elite)
-                    // mover hacia elite con perturbación Lévy
-                    for (int i=0; i<n; i++) {
-                        candidate[i] = 0.5*candidate[i] + 0.5*X[eliteIdx][i];
-                    }
-                    levyJump(candidate, 0.01);
+                // Fases del MPA
+                if (progress < 1.0/3.0) {
+                    brownianMove(cand, BROW_SIGMA_F1);
+                } else if (progress < 2.0/3.0) {
+                    brownianMove(cand, BROW_SIGMA_F2);
+                    levyJump(cand, LEVY_SCALE_F2);
+                } else {
+                    // Intensificación alrededor del elite
+                    for (int i=0; i<n; i++) cand[i] = 0.5*cand[i] + 0.5*X[eliteIdx][i];
+                    levyJump(cand, LEVY_SCALE_F3);
                 }
+                clamp01(cand);
 
-                clamp01(candidate);
-
-                Solution s = decoder.decode(candidate, orders);
-                if (s.fitness > fitness[p].fitness) {
-                    X[p] = candidate;
-                    fitness[p] = s;
+                Solution s = decoder.decode(cand, orders);
+                if (s.fitness > fit[p].fitness) {
+                    X[p] = cand;
+                    fit[p] = s;
                     if (s.fitness > elite.fitness) {
                         elite = s;
                         eliteIdx = p;
+                        lastImprove = System.currentTimeMillis();
                     }
                 }
             }
+
+            // Early stop: sin mejora por una ventana de tiempo
+            if (System.currentTimeMillis() - lastImprove > noImproveMillis) break;
         }
 
         long runtime = System.currentTimeMillis() - t0;
@@ -94,19 +116,15 @@ public class MPAPlanner {
 
     // Movimiento Browniano ~ N(0, sigma^2)
     private void brownianMove(double[] v, double sigma) {
-        for (int i=0; i<v.length; i++) {
-            v[i] += sigma * rnd.nextGaussian();
-        }
+        for (int i=0; i<v.length; i++) v[i] += sigma * rnd.nextGaussian();
     }
 
-    // Salto Lévy (simplificado): heavy-tail con alfa~1.5 aprox.
+    // Salto Lévy con sigma precomputada (menos costo por elemento)
     private void levyJump(double[] v, double scale) {
         for (int i=0; i<v.length; i++) {
             double u = rnd.nextGaussian() * scale;
-            double vgauss = rnd.nextGaussian();
-            double beta = 1.5;
-            double sigma = Math.pow( (gamma(1+beta)*Math.sin(Math.PI*beta/2)) / (gamma((1+beta)/2)*beta*Math.pow(2, (beta-1)/2)), 1/beta );
-            double step = u / Math.pow(Math.abs(vgauss), 1/beta) * sigma;
+            double vg = rnd.nextGaussian();
+            double step = (u / Math.pow(Math.abs(vg), 1.0/LEVY_BETA)) * levySigma;
             v[i] += step;
         }
     }
@@ -118,7 +136,15 @@ public class MPAPlanner {
         }
     }
 
-    // Aproximación de Gamma (Lanczos reducido)
+    // Sigma de Lévy (estable) para beta=1.5
+    private double computeLevySigma(double beta) {
+        // Fórmula estándar (Mantegna) con función gamma
+        double num = gamma(1+beta) * Math.sin(Math.PI*beta/2.0);
+        double den = gamma((1+beta)/2.0) * beta * Math.pow(2.0, (beta-1.0)/2.0);
+        return Math.pow(num/den, 1.0/beta);
+    }
+
+    // Aproximación de Gamma (Lanczos)
     private double gamma(double z) {
         double[] p = { 676.5203681218851, -1259.1392167224028, 771.32342877765313,
                 -176.61502916214059, 12.507343278686905, -0.13857109526572012,
